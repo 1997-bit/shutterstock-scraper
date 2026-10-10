@@ -19,6 +19,13 @@
  * Si los valores no coinciden, el script no guarda ese dia.
  * Para reintentar ese dia, corre el script otra vez.
  *
+ * Lectura de pestañas
+ * Despues de un clic en una pestaña, la pagina muestra una tabla de carga.
+ * La tabla de carga no tiene IDs de assets.
+ * El script espera hasta que la tabla tenga al menos un ID de asset.
+ * Si una pestaña devuelve 0 filas, el script la lee otra vez.
+ * El script hace hasta 3 intentos por pestaña.
+ *
  * Cierre del modal
  * El script guarda el dia antes de cerrar el modal.
  * Si el modal no cierra, el dia no se pierde.
@@ -104,6 +111,10 @@ const CONFIG = {
   // Cada intento de cierre espera este tiempo antes de repetir el clic.
   TIMEOUT_CERRAR_MS: 2500,
   INTENTOS_CERRAR: 3,
+  // Intentos para leer una pestaña que devuelve 0 filas.
+  INTENTOS_PESTANA: 3,
+  // Espera entre dos intentos de lectura de una pestaña.
+  ESPERA_REINTENTO_MS: 1500,
   CODIGOS_BLOQUEO: [429, 403, 503],
 
   // Prefijo de las claves por dia en localStorage.
@@ -119,6 +130,7 @@ const SEL = {
   dialogo: '[role="dialog"]',
   tabs: '[data-testid="ProductTabFilters"]',
   tablaAssets: 'table[data-testid="AssetsTable"]',
+  cuerpoCarga: "TableLoadingBody",
   paginador: '[data-testid="EarningsDateDialogPagination"]',
   totalPaginas: '[data-testid="pagination-countTotal"]',
   paginaActual: ".MuiPaper-root",
@@ -246,6 +258,7 @@ const M = {
   error: 0,
   pestanas: 0,
   paginas: 0,
+  reintentosPestana: 0,
   filas: 0,
   ventas: 0,
   partidas: 0,
@@ -364,15 +377,18 @@ const leerFilas = d => {
   return out;
 };
 
-// Firma barata del contenido de la tabla.
-// Compara el texto del tbody. No analiza las filas.
+// Firma del contenido de la tabla.
+// Devuelve texto vacio si la tabla esta en carga o si no hay un ID de asset.
 const firma = d => {
   const tb = d.querySelector(`${SEL.tablaAssets} tbody`);
-  return tb ? tb.textContent : "";
+  if (!tb) return "";
+  if (tb.getAttribute("data-testid") === SEL.cuerpoCarga) return "";
+  const txt = tb.textContent;
+  return RE_ID.test(txt) ? txt : "";
 };
 
 // Lee todas las paginas de la pestaña activa.
-const leerPestana = async (d, esperadoTab) => {
+const leerPestana = async d => {
   const pag = d.querySelector(SEL.paginador) || d;
   const totTxt = pag.querySelector(SEL.totalPaginas);
   const total = totTxt ? parseInt(totTxt.textContent.replace(/\D/g, "")) || 1 : 1;
@@ -394,7 +410,7 @@ const leerPestana = async (d, esperadoTab) => {
     }
     sig.click();
     await esperaPor(
-      () => paginaActual() !== antesPag && firma(d) !== antesFirma,
+      () => paginaActual() !== antesPag && firma(d) !== "" && firma(d) !== antesFirma,
       8000,
       "pagina " + p,
       d
@@ -402,12 +418,6 @@ const leerPestana = async (d, esperadoTab) => {
     await esperaQuieto(d, 150);
     for (const f of leerFilas(d)) filas.push(f);
     M.paginas++;
-  }
-
-  let cuenta = 0;
-  for (const f of filas) cuenta += f.n;
-  if (esperadoTab != null && cuenta !== esperadoTab) {
-    console.warn(`   la pestaña indica ${esperadoTab} descargas, el script leyo ${cuenta}, paginas ${total}`);
   }
   return filas;
 };
@@ -434,6 +444,7 @@ const leerDia = async (d, fecha) => {
 
     // El nombre de la pestaña es el tipo de licencia.
     const lic = m[1].trim();
+    const esperadoTab = parseInt(m[2]);
     M.pestanas++;
 
     let antes = "";
@@ -444,16 +455,31 @@ const leerDia = async (d, fecha) => {
       await esperaPor(() => b.getAttribute("aria-selected") === "true", 3000, "pestaña " + lic, d);
     }
 
-    // Despues del clic, la red puede tardar. Espera filas nuevas.
+    // Espera filas reales. Una tabla en carga tiene firma vacia.
     await esperaPor(() => {
       const h = firma(d);
       return h !== "" && h !== antes;
     }, CONFIG.TIMEOUT_FILAS_MS, "filas de " + lic, d);
     await esperaQuieto(d, 200);
 
-    for (const f of await leerPestana(d, parseInt(m[2]))) {
+    // Si la pestaña devuelve 0 filas, espera y lee otra vez.
+    let de = [];
+    for (let intento = 1; intento <= CONFIG.INTENTOS_PESTANA; intento++) {
+      de = await leerPestana(d);
+      if (de.length > 0) break;
+      M.reintentosPestana++;
+      console.warn(`   pestaña ${lic}: 0 filas, intento ${intento} de ${CONFIG.INTENTOS_PESTANA}`);
+      await espera(CONFIG.ESPERA_REINTENTO_MS);
+    }
+
+    let cuenta = 0;
+    for (const f of de) {
       f.lic = lic;
       filas.push(f);
+      cuenta += f.n;
+    }
+    if (cuenta !== esperadoTab) {
+      console.warn(`   la pestaña ${lic} indica ${esperadoTab} descargas, el script leyo ${cuenta}`);
     }
   }
   return { filas, espN, espC };
@@ -737,6 +763,7 @@ if (M.dias.length) {
     { Metrica: "Dias procesados", Valor: total },
     { Metrica: "Guardados / REVISAR / ERROR", Valor: `${M.ok} / ${M.revisar} / ${M.error}` },
     { Metrica: "Guardados con ingresos sin asset", Valor: M.conExtra },
+    { Metrica: "Reintentos de pestaña", Valor: M.reintentosPestana },
     { Metrica: "Cierres de modal fallidos", Valor: M.cierresFallidos },
     { Metrica: "Tasa de exito", Valor: Math.round(M.ok / total * 100) + "%" },
     { Metrica: "Trabajo por dia, promedio y mediana", Valor: `${fmt(promedio)} / ${fmt(mediana)}` },
